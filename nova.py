@@ -38,7 +38,7 @@ from pathlib import Path
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-MIC_DEVICE        = "hw:2,0"
+MIC_DEVICE        = "hw:0,0"
 MIC_RATE          = 16000
 MIC_CHANNELS      = 1
 MIC_FORMAT        = "S16_LE"
@@ -297,6 +297,7 @@ def speak(text):
         ]
         aplay_cmd = [
             "aplay",
+            "-D", "hw:1,3"
             "-r", str(PIPER_RATE),
             "-f", "S16_LE",
             "-c", "1"
