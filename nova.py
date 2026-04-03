@@ -297,7 +297,7 @@ def speak(text):
         ]
         aplay_cmd = [
             "aplay",
-            "-D", "hw:1,3"
+            "-D", "hw:1,3",
             "-r", str(PIPER_RATE),
             "-f", "S16_LE",
             "-c", "1"
