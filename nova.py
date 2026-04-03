@@ -4,9 +4,9 @@ Nova - AI Companion for the Rugge Family
 Runs on Jetson Orin Nano with Ollama (gemma4:e2b), Faster-Whisper STT, and Piper TTS.
 
 Hardware:
-  - Mic:    Microsoft LifeCam Cinema  (ALSA hw:2,0)
+  - Mic:    Microsoft LifeCam Cinema  (ALSA plughw:0,0)
   - Camera: /dev/video0 (Microsoft LifeCam Cinema)
-  - Audio:  DisplayPort monitor speakers (PulseAudio default sink)
+  - Audio:  DisplayPort monitor speakers (hw:1,3)
 
 Usage:
   python3 nova.py                  # Vision-based speaker identification (default)
@@ -38,7 +38,9 @@ from pathlib import Path
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-MIC_DEVICE        = "hw:0,0"
+# FIX 1: Use plughw instead of hw — allows ALSA to do format/rate conversion.
+# hw:0,0 is strict and can fail silently if the device is busy or rate mismatches.
+MIC_DEVICE        = "plughw:0,0"
 MIC_RATE          = 16000
 MIC_CHANNELS      = 1
 MIC_FORMAT        = "S16_LE"
@@ -151,6 +153,10 @@ def identify_person_via_vision(family_config):
     """
     Capture a frame and ask gemma4:e2b to identify who is in the image.
     Returns a family member dict, or None for unknown.
+
+    FIX 2: Ollama's multimodal API requires images to be passed in the
+    content array as image_url objects, not as a top-level 'images' key.
+    The old format caused HTTP 500 on newer Ollama builds with gemma4.
     """
     if not family_config:
         return None
@@ -170,20 +176,31 @@ def identify_person_via_vision(family_config):
     names = [m["name"] for m in family_config.FAMILY_MEMBERS]
     names_str = ", ".join(names)
 
-    prompt = (
+    prompt_text = (
         f"Look at this image carefully. The person in the image is a member of the Rugge family. "
         f"Their names are: {names_str}. "
         f"Reply with ONLY the single first name of the person you see, exactly as listed. "
         f"If you cannot identify them or no person is clearly visible, reply with exactly: Unknown"
     )
 
+    # FIX: Use content array format with image_url — required for Ollama multimodal
     payload = json.dumps({
         "model": OLLAMA_MODEL,
         "messages": [
             {
                 "role": "user",
-                "content": prompt,
-                "images": [img_b64]
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{img_b64}"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt_text
+                    }
+                ]
             }
         ],
         "stream": False
@@ -216,20 +233,25 @@ def identify_person_via_vision(family_config):
                 print(f"   ⚠️  '{identified_name}' not matched in family config")
                 return None
 
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"   ⚠️  Vision HTTP {e.code}: {body[:300]}")
+        return None
     except Exception as e:
         print(f"   ⚠️  Vision identification error: {e}")
         return None
 
 
-def confirm_identification(member, speak_fn):
+def confirm_identification(member, speak_fn, whisper_model):
     """
     Ask Nova to confirm identification aloud. Returns True if confirmed,
     False if the person says no (triggering a fallback ask).
+
+    FIX 3: Accept whisper_model as parameter instead of reloading it.
     """
     name = member["name"]
     speak_fn(f"Oh! Is that you, {name}?")
 
-    # Listen for a yes/no
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         tmp = f.name
 
@@ -238,16 +260,13 @@ def confirm_identification(member, speak_fn):
         return True  # assume yes on capture failure
 
     try:
-        from faster_whisper import WhisperModel
-        wm = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-        segments, _ = wm.transcribe(tmp, language="en")
+        segments, _ = whisper_model.transcribe(tmp, language="en")
         response = " ".join(s.text.strip() for s in segments).strip().lower()
         os.unlink(tmp)
         print(f"   Confirmation response: '{response}'")
-        # Simple yes/no detection
         if any(word in response for word in ["no", "nope", "not", "wrong", "nah"]):
             return False
-        return True  # default to confirmed
+        return True
     except Exception:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -268,7 +287,9 @@ def record_audio(filename, seconds=RECORD_SECONDS):
         "-d", str(seconds),
         filename
     ]
-    result = subprocess.run(cmd, capture_output=True)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"   arecord error: {result.stderr.strip()}")
     return result.returncode == 0
 
 
@@ -411,7 +432,7 @@ def main():
     # Load family config
     family_config = load_family_config()
 
-    # Load Whisper once
+    # Load Whisper once — passed to all functions that need it
     print("⏳ Loading speech recognition model...")
     try:
         from faster_whisper import WhisperModel
@@ -442,10 +463,9 @@ def main():
         if family_config and os.path.exists(CAMERA_DEVICE):
             member = identify_person_via_vision(family_config)
             if member:
-                # Confirm identification aloud
-                confirmed = confirm_identification(member, speak)
+                # FIX: Pass whisper_model instead of reloading inside confirm_identification
+                confirmed = confirm_identification(member, speak, whisper_model)
                 if not confirmed:
-                    # Ask directly
                     speak("Sorry about that! Who am I talking to?")
                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                         tmp = f.name
