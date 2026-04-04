@@ -43,10 +43,10 @@ OLLAMA_URL       = "http://localhost:11434/api/generate"
 OLLAMA_MODEL     = "gemma3:4b"
 
 VISION_PROMPT = (
-    "You are Nova's eyes. Describe what you see in this image in 2-3 sentences. "
-    "Be specific and factual — mention people, objects, lighting, and activity. "
-    "Do not speculate about things you cannot see. "
-    "Write as if giving a quiet, observant report to Nova so she can be aware of her surroundings."
+    "Describe this image in 2-3 short sentences. "
+    "State only what is clearly visible: people, objects, lighting, activity. "
+    "Be direct and factual. Do not introduce yourself or add preamble. "
+    "Example: A man sits at a desk with a laptop. The room is warmly lit. A dog is visible in the background."
 )
 
 # ── Capture frame ─────────────────────────────────────────────────────────────
