@@ -1,30 +1,43 @@
 #!/bin/bash
 # nova_launch.sh — Nova AI Companion launcher
+#
+# Hardware-aware: Jetson optimizations applied automatically when available.
+# Works on any Linux system with Ollama, Piper, and Faster-Whisper installed.
+#
 # Usage:
-#   ./nova_launch.sh                          # vision-based speaker ID
-#   ./nova_launch.sh --user sam              # identify as Sam
-#   ./nova_launch.sh --user jane --skills education
-#   ./nova_launch.sh --user james --skills homework,fitness
+#   ./nova_launch.sh                            # vision-based speaker ID
+#   ./nova_launch.sh --user sean                # identify as Sean
+#   ./nova_launch.sh --user devyn --skills education
+#   ./nova_launch.sh --user jihan --skills homework,fitness
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+JETSON_CLOCKS_RESTORE=/tmp/nova_clocks_restore
 
 echo "🚀 Starting Nova..."
 
-# Save current clock state and pin to max for inference performance
-sudo jetson_clocks --store /tmp/nova_clocks_restore
-sudo jetson_clocks
-echo "⚡ Clocks pinned to max"
+# ── Jetson: pin clocks for inference performance ───────────────────────────────
+JETSON_CLOCKS_ACTIVE=false
+if command -v jetson_clocks &>/dev/null; then
+    sudo jetson_clocks --store "$JETSON_CLOCKS_RESTORE"
+    sudo jetson_clocks
+    JETSON_CLOCKS_ACTIVE=true
+    echo "⚡ Clocks pinned (Jetson)"
+fi
 
-# Restart PulseAudio and ensure correct audio sink
-pulseaudio --kill 2>/dev/null
-sleep 2
-pulseaudio --daemonize=yes
-sleep 3
-echo "🔊 Audio ready"
+# ── PulseAudio: restart and ensure correct sink ───────────────────────────────
+if command -v pulseaudio &>/dev/null; then
+    pulseaudio --kill 2>/dev/null
+    sleep 2
+    pulseaudio --daemonize=yes
+    sleep 3
+    echo "🔊 Audio ready (PulseAudio)"
+fi
 
-# Launch Nova — all arguments passed through
+# ── Launch Nova — all arguments passed through ────────────────────────────────
 python3 "$SCRIPT_DIR/nova.py" "$@"
 
-# Restore clocks on exit
-sudo jetson_clocks --restore /tmp/nova_clocks_restore
-echo "🔋 Clocks restored"
+# ── Jetson: restore clocks on exit ────────────────────────────────────────────
+if [ "$JETSON_CLOCKS_ACTIVE" = true ] && [ -f "$JETSON_CLOCKS_RESTORE" ]; then
+    sudo jetson_clocks --restore "$JETSON_CLOCKS_RESTORE"
+    echo "🔋 Clocks restored"
+fi
