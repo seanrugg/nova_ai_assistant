@@ -1,0 +1,18 @@
+# Nova AI Companion — Jetson-specific Python dependencies
+# Use this instead of requirements.txt on NVIDIA Jetson hardware.
+#
+# Install with: pip install -r requirements-jetson.txt --break-system-packages
+#
+# Tested on: Jetson Orin Nano 8GB, JetPack 6.2.2, Ubuntu 22.04 (ARM64)
+#
+# Notes:
+# - onnxruntime: CPU build used intentionally — Whisper runs on CPU,
+#   GPU is reserved for Ollama LLM inference via CUDA
+# - numpy 2.x required for faster-whisper 1.2.x compatibility on ARM64
+# - Ollama and Piper TTS are installed separately — see README.md
+
+faster-whisper==1.2.1
+huggingface-hub==1.9.0
+numpy==2.2.6
+onnxruntime==1.23.2
+tokenizers==0.22.2
