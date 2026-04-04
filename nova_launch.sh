@@ -11,18 +11,22 @@
 #   ./nova_launch.sh --user jihan --skills homework,fitness
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-JETSON_CLOCKS_RESTORE=/tmp/nova_clocks_restore
+JETSON_CLOCKS_BASELINE="$SCRIPT_DIR/jetson_clocks_baseline"
 
 echo "🚀 Starting Nova..."
 
 # ── Jetson: pin clocks for inference performance ───────────────────────────────
 JETSON_CLOCKS_ACTIVE=false
 if command -v jetson_clocks &>/dev/null; then
-    rm -f "$JETSON_CLOCKS_RESTORE"
-    sudo jetson_clocks --store "$JETSON_CLOCKS_RESTORE"
+    # Capture clean baseline on first run only — never overwrite it
+    if [ ! -f "$JETSON_CLOCKS_BASELINE" ]; then
+        echo "   Capturing clock baseline (first run)..."
+        sudo jetson_clocks --store "$JETSON_CLOCKS_BASELINE"
+    fi
     sudo jetson_clocks
     JETSON_CLOCKS_ACTIVE=true
     echo "⚡ Clocks pinned (Jetson)"
+    sleep 3  # Allow PSU to stabilize before starting audio and inference
 fi
 
 # ── PulseAudio: restart and ensure correct sink ───────────────────────────────
@@ -38,7 +42,9 @@ fi
 python3 "$SCRIPT_DIR/nova.py" "$@"
 
 # ── Jetson: restore clocks on exit ────────────────────────────────────────────
-if [ "$JETSON_CLOCKS_ACTIVE" = true ] && [ -f "$JETSON_CLOCKS_RESTORE" ]; then
-    sudo jetson_clocks --restore "$JETSON_CLOCKS_RESTORE"
+if [ "$JETSON_CLOCKS_ACTIVE" = true ] && [ -f "$JETSON_CLOCKS_BASELINE" ]; then
+    sudo jetson_clocks --restore "$JETSON_CLOCKS_BASELINE"
+    # Reset EMC frequency override which jetson_clocks --restore doesn't fully clear
+    sudo bash -c 'echo 0 > /sys/kernel/debug/bpmp/debug/clk/emc/mrq_rate_locked' 2>/dev/null
     echo "🔋 Clocks restored"
 fi
