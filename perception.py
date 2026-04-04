@@ -65,9 +65,13 @@ def load_labels(path):
     labels = {}
     for line in lines:
         parts = line.strip().split(None, 1)
-        if len(parts) == 2:
+        if not parts:
+            continue
+        # Format: "0 person" — numeric index + label
+        if len(parts) == 2 and parts[0].isdigit():
             labels[int(parts[0])] = parts[1]
-        elif len(parts) == 1:
+        # Format: "person" — label only, auto-index
+        else:
             labels[len(labels)] = parts[0]
     return labels
 
