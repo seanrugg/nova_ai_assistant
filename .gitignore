@@ -26,6 +26,7 @@ venv/
 
 # Jetson clock save file
 nova_clocks_restore
+jetson_clocks_baseline
 
 # OS
 .DS_Store
