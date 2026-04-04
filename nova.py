@@ -9,10 +9,8 @@ Hardware:
   - Camera: /dev/video0 (Microsoft LifeCam Cinema)
 
 Usage:
-  python3 nova.py                              # vision-based speaker ID
-  python3 nova.py --user sean                  # skip vision, identify as Sean
-  python3 nova.py --user devyn --skills education
-  python3 nova.py --user jihan --skills homework,fitness
+  python3 nova.py                # vision-based speaker ID
+  python3 nova.py --user sean    # skip vision, identify as Sean
 
 Press Ctrl+C to exit.
 """
@@ -29,12 +27,6 @@ import urllib.request
 import urllib.error
 import json
 import base64
-import re
-import importlib.util
-
-# ── Perception ────────────────────────────────────────────────────────────────
-PERCEPTION_OUTPUT   = os.path.expanduser("~/.nova_perception.json")
-PERCEPTION_MAX_AGE  = 30  # seconds — ignore stale observations
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -65,12 +57,8 @@ WHISPER_MODEL      = "base"
 # Camera
 CAMERA_DEVICE      = "/dev/video0"
 
-# Family config — lives at family_config/family_config.py relative to this script
-_SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
-FAMILY_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "family_config", "family_config.py")
-
-# Skills — lives at skills/ relative to this script
-SKILLS_DIR         = os.path.join(_SCRIPT_DIR, "skills")
+# Family config
+FAMILY_CONFIG_PATH = os.path.expanduser("~/nova_config/family_config.py")
 
 # ── Load family config ────────────────────────────────────────────────────────
 
@@ -78,50 +66,15 @@ def load_family_config():
     if not os.path.exists(FAMILY_CONFIG_PATH):
         print(f"Warning: Family config not found at {FAMILY_CONFIG_PATH}")
         return None
+    import importlib.util
     spec = importlib.util.spec_from_file_location("family_config", FAMILY_CONFIG_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
-# ── Load skills ───────────────────────────────────────────────────────────────
-
-def load_skills(skill_names, user_persona=None):
-    """
-    Load skill modules by name from skills/.
-    If user_persona is provided, filters to skills that list that persona
-    (or skills with no persona filter at all).
-    Returns list of loaded skill modules.
-    """
-    if not skill_names:
-        return []
-
-    loaded = []
-    for name in skill_names:
-        path = os.path.join(SKILLS_DIR, f"skill_{name}.py")
-        if not os.path.exists(path):
-            print(f"Warning: Skill '{name}' not found at {path}")
-            continue
-        try:
-            spec = importlib.util.spec_from_file_location(f"skill_{name}", path)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-
-            # Persona filter: if skill declares SKILL_PERSONAS, check compatibility
-            skill_personas = getattr(mod, "SKILL_PERSONAS", None)
-            if skill_personas and user_persona and user_persona not in skill_personas:
-                print(f"Skill '{name}' skipped (persona '{user_persona}' not in {skill_personas})")
-                continue
-
-            loaded.append(mod)
-            print(f"✅ Skill loaded: {getattr(mod, 'SKILL_NAME', name)}")
-        except Exception as e:
-            print(f"Warning: Could not load skill '{name}': {e}")
-
-    return loaded
-
 # ── Build system prompt ───────────────────────────────────────────────────────
 
-def build_system_prompt(family_config, member_name=None, skills=None):
+def build_system_prompt(family_config, member_name=None):
     if family_config is None:
         return "You are Nova, a friendly AI companion. Be warm, helpful, and concise."
 
@@ -130,31 +83,19 @@ def build_system_prompt(family_config, member_name=None, skills=None):
     if member_name is None:
         profile = family_config.UNKNOWN_VISITOR_PROFILE.strip()
         style = family_config.PERSONAS["adult"]["style"].strip()
-        base = f"{identity}\n\n{style}\n\n{profile}"
-    else:
-        member = next(
-            (m for m in family_config.FAMILY_MEMBERS if m["name"].lower() == member_name.lower()),
-            None
-        )
-        if member is None:
-            profile = family_config.UNKNOWN_VISITOR_PROFILE.strip()
-            style = family_config.PERSONAS["adult"]["style"].strip()
-            base = f"{identity}\n\n{style}\n\n{profile}"
-        else:
-            persona = family_config.PERSONAS.get(member["persona"], family_config.PERSONAS["adult"])
-            base = f"{identity}\n\n{persona['style'].strip()}\n\n{member['profile'].strip()}"
+        return f"{identity}\n\n{style}\n\n{profile}"
 
-    # Append skill prompts
-    if skills:
-        skill_blocks = []
-        for skill in skills:
-            prompt = getattr(skill, "SKILL_PROMPT", "").strip()
-            if prompt:
-                skill_blocks.append(prompt)
-        if skill_blocks:
-            base += "\n\n" + "\n\n".join(skill_blocks)
+    member = next(
+        (m for m in family_config.FAMILY_MEMBERS if m["name"].lower() == member_name.lower()),
+        None
+    )
+    if member is None:
+        profile = family_config.UNKNOWN_VISITOR_PROFILE.strip()
+        style = family_config.PERSONAS["adult"]["style"].strip()
+        return f"{identity}\n\n{style}\n\n{profile}"
 
-    return base
+    persona = family_config.PERSONAS.get(member["persona"], family_config.PERSONAS["adult"])
+    return f"{identity}\n\n{persona['style'].strip()}\n\n{member['profile'].strip()}"
 
 # ── Audio recording ───────────────────────────────────────────────────────────
 
@@ -281,25 +222,8 @@ def identify_person(family_config):
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
 
-def clean_for_speech(text):
-    """Strip markdown and symbols that TTS would read aloud awkwardly."""
-    # Strip leading "Nova:" prefix the model sometimes adds to its own responses
-    text = re.sub(r'^Nova:\s*', '', text, flags=re.IGNORECASE)
-    # Remove parenthetical stage directions e.g. (A quiet whirring sound)
-    text = re.sub(r'\([^)]*\)', '', text)
-    # Remove bold and italic markers (**text**, *text*, __text__, _text_)
-    text = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', text)
-    text = re.sub(r'_{1,2}([^_]+)_{1,2}', r'\1', text)
-    # Remove standalone asterisks, hashes, backticks
-    text = re.sub(r'[*#`]', '', text)
-    # Remove markdown links [text](url) → text
-    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
-    # Collapse multiple spaces
-    text = re.sub(r' {2,}', ' ', text)
-    return text.strip()
-
-
 def speak(text):
+    """Speak text through a single piper+aplay pipeline. No per-sentence gaps."""
     text = clean_for_speech(text)
     if not text:
         return
@@ -323,14 +247,32 @@ def speak(text):
 
 # ── Ollama ────────────────────────────────────────────────────────────────────
 
-# Sentence-ending punctuation used to split the stream into speakable chunks
-SENTENCE_ENDINGS = {'.', '!', '?'}
+def ask_ollama(messages):
+    payload = json.dumps({
+        "model": OLLAMA_MODEL,
+        "messages": messages,
+        "stream": False
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        OLLAMA_URL, data=payload,
+        headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data["message"]["content"].strip()
+    except Exception as e:
+        print(f"   Ollama error: {e}")
+        return "I had a little hiccup. Can you say that again?"
 
 
 def ask_ollama_streaming(messages):
     """
-    Stream tokens from Ollama. Speak each sentence as it completes.
-    Returns the full response text for conversation history.
+    Stream tokens from Ollama for low-latency token display, then speak
+    the full response through ONE persistent piper+aplay pipeline.
+
+    Launching a new aplay process per sentence creates ~150ms gaps (audible chop
+    for a child). A single pipeline eliminates this entirely — speech is seamless.
     """
     payload = json.dumps({
         "model": OLLAMA_MODEL,
@@ -342,7 +284,6 @@ def ask_ollama_streaming(messages):
         headers={"Content-Type": "application/json"}, method="POST"
     )
     full_reply = ""
-    buffer = ""
 
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -354,36 +295,39 @@ def ask_ollama_streaming(messages):
                     chunk = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-
                 token = chunk.get("message", {}).get("content", "")
-                if not token:
-                    continue
-
-                buffer += token
-                full_reply += token
-
-                # Speak when we hit a sentence boundary
-                if any(buffer.rstrip().endswith(p) for p in SENTENCE_ENDINGS):
-                    sentence = clean_for_speech(buffer.strip())
-                    # Skip trivial content: empty, numbers only, single characters
-                    if sentence and not re.match(r'^[\d\.\,\s]+$', sentence) and len(sentence) > 2:
-                        speak(sentence)
-                    buffer = ""
-
+                if token:
+                    full_reply += token
+                    print(token, end="", flush=True)
                 if chunk.get("done", False):
                     break
-
-        # Speak any remaining buffer
-        if buffer.strip():
-            sentence = clean_for_speech(buffer.strip())
-            if sentence and not re.match(r'^[\d\.\,\s]+$', sentence) and len(sentence) > 2:
-                speak(sentence)
-
     except Exception as e:
-        print(f"   Ollama error: {e}")
+        print(f"\n   Ollama error: {e}")
         fallback = "I had a little hiccup. Can you say that again?"
         speak(fallback)
         return fallback
+
+    print()  # newline after streamed tokens
+
+    # Speak full response through one pipeline — no gaps between sentences
+    speech_text = clean_for_speech(full_reply.strip())
+    if speech_text:
+        try:
+            piper_proc = subprocess.Popen(
+                [PIPER_BIN, "--model", PIPER_VOICE, "--output_raw"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            aplay_proc = subprocess.Popen(
+                ["aplay", "-r", str(PIPER_RATE), "-f", "S16_LE", "-c", "1"],
+                stdin=piper_proc.stdout, stderr=subprocess.DEVNULL
+            )
+            piper_proc.stdin.write(speech_text.encode("utf-8"))
+            piper_proc.stdin.close()
+            piper_proc.stdout.close()
+            aplay_proc.wait()
+            piper_proc.wait()
+        except Exception as e:
+            print(f"   TTS error: {e}")
 
     return full_reply.strip()
 
@@ -397,9 +341,15 @@ def check_ollama():
 
 # ── Perception ────────────────────────────────────────────────────────────────
 
+PERCEPTION_OUTPUT  = os.path.expanduser("~/.nova_perception.json")
+PERCEPTION_MAX_AGE = 360  # 6 minutes — matches 5-min capture interval with margin
+
+# Mutable container so the main loop can update it without global keyword
+_last_perception = [None]
+
+
 def read_perception():
-    """Read the latest perception observation from perception.py output.
-    Returns a natural language string, or None if unavailable/stale."""
+    """Read the latest perception observation. Returns string or None if stale/missing."""
     try:
         if not os.path.exists(PERCEPTION_OUTPUT):
             return None
@@ -417,8 +367,6 @@ def read_perception():
 def main():
     parser = argparse.ArgumentParser(description="Nova AI Companion")
     parser.add_argument("--user", type=str, default=None)
-    parser.add_argument("--skills", type=str, default=None,
-                        help="Comma-separated skill names to load, e.g. education,homework")
     args = parser.parse_args()
 
     print("=" * 55)
@@ -429,57 +377,39 @@ def main():
     if not check_ollama():
         print("Ollama is not running. Start it with: ollama serve")
         sys.exit(1)
-    print("✅ Ollama connected")
+    print("Ollama connected")
 
     if not os.path.exists(PIPER_BIN):
         print(f"Piper not found at {PIPER_BIN}")
         sys.exit(1)
-    print("✅ Piper ready")
+    print("Piper ready")
 
     if not os.path.exists(PIPER_VOICE):
         print(f"Voice model not found at {PIPER_VOICE}")
         sys.exit(1)
-    print("✅ Voice model ready (Alba)")
+    print("Voice model ready (Alba)")
 
     family_config = load_family_config()
     if family_config:
         names = [m["name"] for m in family_config.FAMILY_MEMBERS]
-        print(f"✅ Family config loaded ({', '.join(names)})")
+        print(f"Family config loaded ({', '.join(names)})")
 
     if args.user:
         current_user = args.user.capitalize()
-        print(f"✅ User: {current_user}")
+        print(f"User: {current_user}")
     else:
         print("Identifying speaker via vision...")
         current_user = identify_person(family_config)
         if current_user is None:
             print("Could not identify — using unknown visitor profile")
 
-    # Determine persona for skill filtering
-    user_persona = None
-    if current_user and family_config:
-        member = next(
-            (m for m in family_config.FAMILY_MEMBERS if m["name"].lower() == current_user.lower()),
-            None
-        )
-        if member:
-            user_persona = member.get("persona")
-
-    # Load skills
-    skill_names = [s.strip() for s in args.skills.split(",")] if args.skills else []
-    skills = load_skills(skill_names, user_persona)
-    if not skills and skill_names:
-        print("No skills loaded.")
-    elif skills:
-        print(f"✅ Skills active: {', '.join(getattr(s, 'SKILL_NAME', '?') for s in skills)}")
-
-    system_prompt = build_system_prompt(family_config, current_user, skills)
+    system_prompt = build_system_prompt(family_config, current_user)
 
     print("Loading Whisper...")
     try:
         from faster_whisper import WhisperModel
         whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-        print("✅ Whisper ready\n")
+        print("Whisper ready\n")
     except Exception as e:
         print(f"Could not load Whisper: {e}")
         sys.exit(1)
@@ -521,17 +451,27 @@ def main():
 
             print(f"{current_user or 'Visitor'}: {user_text}")
 
-            # Inject current perception context into user message if available
+            # Inject perception context — only when scene has changed, or
+            # when the user asks something vision-related
             perception = read_perception()
-            if perception:
+            if perception and perception != _last_perception[0]:
                 user_content = f"[Nova's current visual awareness: {perception}]\n\n{user_text}"
+                _last_perception[0] = perception
+            elif perception:
+                vision_words = {"see", "look", "room", "there", "what's", "spy",
+                                "notice", "around", "eye", "watch", "show"}
+                if any(w in user_text.lower() for w in vision_words):
+                    user_content = f"[Nova's current visual awareness: {perception}]\n\n{user_text}"
+                else:
+                    user_content = user_text
             else:
                 user_content = user_text
+
             messages.append({"role": "user", "content": user_content})
 
             reply = ask_ollama_streaming(messages)
-            print()
             messages.append({"role": "assistant", "content": reply})
+            print()
 
             if len(messages) > 22:
                 messages = [messages[0]] + messages[-20:]
