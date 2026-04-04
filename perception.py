@@ -3,9 +3,9 @@
 perception.py — Nova's visual awareness engine
 Runs on the Coral TPU via coral_env venv.
 
-This script runs as a background process, capturing frames from the LifeCam,
-running person and object detection on the Coral TPU, and writing structured
-environment observations to a shared JSON file that nova.py reads periodically.
+Captures frames from the LifeCam using ffmpeg, runs person and object
+detection on the Coral TPU, and writes structured environment observations
+to a shared JSON file that nova.py reads periodically.
 
 Usage:
     ~/coral_env/bin/python3 perception.py
@@ -15,42 +15,43 @@ Output:
 
 Dependencies (coral_env):
     tflite-runtime==2.17.0
-    numpy<2
-    opencv-python
+    numpy==1.26.4
+    Pillow
 
-Models required (~/coral_models/):
-    ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite
-    coco_labels.txt
+System dependencies (already installed):
+    ffmpeg
+    libedgetpu.so.1
 """
 
 import json
 import os
 import sys
 import time
-import subprocess
-import threading
 import signal
+import subprocess
+import tempfile
 from datetime import datetime
 
 import numpy as np
 import tflite_runtime.interpreter as tflite
-import cv2
+from PIL import Image
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-CAMERA_DEVICE       = 0                  # /dev/video0 — LifeCam
-CAPTURE_INTERVAL    = 5.0               # seconds between perception updates
+CAMERA_DEVICE        = "/dev/video0"
+CAPTURE_INTERVAL     = 5.0               # seconds between perception updates
 CONFIDENCE_THRESHOLD = 0.45             # minimum detection confidence
-MAX_DETECTIONS      = 5                 # max objects to report per frame
-INPUT_SIZE          = 300               # SSD MobileNet input size
+MAX_DETECTIONS       = 5                # max objects to report per frame
+INPUT_SIZE           = 300              # SSD MobileNet input size
 
-MODEL_DIR           = os.path.expanduser("~/coral_models")
-MODEL_PATH          = os.path.join(MODEL_DIR, "ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite")
-LABELS_PATH         = os.path.join(MODEL_DIR, "coco_labels.txt")
-OUTPUT_PATH         = os.path.expanduser("~/.nova_perception.json")
-EDGETPU_LIB         = "libedgetpu.so.1"
+MODEL_DIR    = os.path.expanduser("~/coral_models")
+MODEL_PATH   = os.path.join(MODEL_DIR, "ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite")
+CPU_MODEL    = os.path.join(MODEL_DIR, "ssd_mobilenet_v2_coco_quant_postprocess.tflite")
+LABELS_PATH  = os.path.join(MODEL_DIR, "coco_labels.txt")
+OUTPUT_PATH  = os.path.expanduser("~/.nova_perception.json")
+EDGETPU_LIB  = "libedgetpu.so.1"
 
-# Objects that are meaningful to report in a home environment
+# Objects meaningful to report in a home/barn environment
 RELEVANT_LABELS = {
     "person", "cat", "dog", "laptop", "cell phone", "book",
     "cup", "bottle", "chair", "couch", "tv", "keyboard",
@@ -67,10 +68,10 @@ def load_labels(path):
         parts = line.strip().split(None, 1)
         if not parts:
             continue
-        # Format: "0 person" — numeric index + label
+        # Format: "0 person"
         if len(parts) == 2 and parts[0].isdigit():
             labels[int(parts[0])] = parts[1]
-        # Format: "person" — label only, auto-index
+        # Format: "person" — label only
         else:
             labels[len(labels)] = parts[0]
     return labels
@@ -78,6 +79,7 @@ def load_labels(path):
 # ── Load model ────────────────────────────────────────────────────────────────
 
 def load_model():
+    """Try Coral TPU first, fall back to CPU."""
     try:
         delegate = tflite.load_delegate(EDGETPU_LIB)
         interpreter = tflite.Interpreter(
@@ -85,32 +87,63 @@ def load_model():
             experimental_delegates=[delegate]
         )
         interpreter.allocate_tensors()
-        print("Coral TPU loaded successfully")
+        print("✅ Coral TPU loaded")
         return interpreter, True
     except Exception as e:
-        print(f"Coral TPU unavailable ({e}) — falling back to CPU")
-        interpreter = tflite.Interpreter(model_path=MODEL_PATH.replace(
-            "_edgetpu.tflite", ".tflite"
-        ))
-        interpreter.allocate_tensors()
-        return interpreter, False
+        print(f"⚠️  Coral TPU unavailable ({e}) — falling back to CPU")
+        try:
+            interpreter = tflite.Interpreter(model_path=CPU_MODEL)
+            interpreter.allocate_tensors()
+            print("✅ CPU model loaded")
+            return interpreter, False
+        except Exception as e2:
+            print(f"❌ CPU model also failed: {e2}")
+            sys.exit(1)
+
+# ── Capture frame ─────────────────────────────────────────────────────────────
+
+def capture_frame():
+    """Capture a single frame from the camera using ffmpeg. Returns PIL Image or None."""
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+        tmp_path = f.name
+    try:
+        result = subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "v4l2",
+            "-i", CAMERA_DEVICE,
+            "-frames:v", "1",
+            "-q:v", "2",
+            tmp_path
+        ], capture_output=True, timeout=10)
+
+        if result.returncode != 0 or not os.path.exists(tmp_path):
+            return None
+
+        img = Image.open(tmp_path).convert("RGB")
+        return img
+    except Exception as e:
+        print(f"Frame capture error: {e}")
+        return None
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
 # ── Run inference ─────────────────────────────────────────────────────────────
 
-def run_inference(interpreter, frame):
-    """Run object detection on a frame. Returns list of detections."""
+def run_inference(interpreter, image):
+    """Run object detection on a PIL image. Returns boxes, classes, scores."""
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
 
-    # Resize and preprocess
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    resized = cv2.resize(rgb, (INPUT_SIZE, INPUT_SIZE))
-    input_data = np.expand_dims(resized, axis=0).astype(np.uint8)
+    # Resize to model input size
+    resized = image.resize((INPUT_SIZE, INPUT_SIZE), Image.BILINEAR)
+    input_data = np.expand_dims(np.array(resized, dtype=np.uint8), axis=0)
 
     interpreter.set_tensor(input_details[0]['index'], input_data)
     interpreter.invoke()
 
-    # SSD MobileNet outputs: boxes, classes, scores, count
     boxes   = interpreter.get_tensor(output_details[0]['index'])[0]
     classes = interpreter.get_tensor(output_details[1]['index'])[0]
     scores  = interpreter.get_tensor(output_details[2]['index'])[0]
@@ -153,7 +186,7 @@ def build_observation(boxes, classes, scores, labels, using_tpu):
 
         objects = [d["label"] for d in detections if d["label"] != "person"]
         if objects:
-            unique_objects = list(dict.fromkeys(objects))  # deduplicate, preserve order
+            unique_objects = list(dict.fromkeys(objects))
             parts.append(f"visible objects include: {', '.join(unique_objects)}")
 
         summary = ". ".join(parts).capitalize() + "."
@@ -169,15 +202,15 @@ def build_observation(boxes, classes, scores, labels, using_tpu):
 # ── Write output ──────────────────────────────────────────────────────────────
 
 def write_observation(observation):
+    """Atomic write to output file."""
     tmp = OUTPUT_PATH + ".tmp"
     with open(tmp, "w") as f:
         json.dump(observation, f, indent=2)
-    os.replace(tmp, OUTPUT_PATH)  # atomic write
+    os.replace(tmp, OUTPUT_PATH)
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
-    # Verify model files exist
     if not os.path.exists(MODEL_PATH):
         print(f"Model not found: {MODEL_PATH}")
         print("Run setup_coral_models.sh to download required models")
@@ -190,18 +223,8 @@ def main():
     labels = load_labels(LABELS_PATH)
     interpreter, using_tpu = load_model()
 
-    # Open camera
-    cap = cv2.VideoCapture(CAMERA_DEVICE)
-    if not cap.isOpened():
-        print(f"Could not open camera at /dev/video{CAMERA_DEVICE}")
-        sys.exit(1)
+    print(f"👁️  Perception running — interval: {CAPTURE_INTERVAL}s — output: {OUTPUT_PATH}")
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    print(f"Camera opened — perception running every {CAPTURE_INTERVAL}s")
-    print(f"Output: {OUTPUT_PATH}")
-
-    # Handle Ctrl+C gracefully
     running = True
     def shutdown(sig, frame):
         nonlocal running
@@ -212,26 +235,24 @@ def main():
     while running:
         loop_start = time.time()
 
-        ret, frame = cap.read()
-        if not ret:
-            print("Camera read failed — retrying...")
-            time.sleep(1)
+        image = capture_frame()
+        if image is None:
+            print("Camera capture failed — retrying...")
+            time.sleep(2)
             continue
 
         try:
-            boxes, classes, scores = run_inference(interpreter, frame)
+            boxes, classes, scores = run_inference(interpreter, image)
             observation = build_observation(boxes, classes, scores, labels, using_tpu)
             write_observation(observation)
             print(f"[{observation['timestamp'][:19]}] {observation['summary']}")
         except Exception as e:
             print(f"Inference error: {e}")
 
-        # Sleep for remainder of interval
         elapsed = time.time() - loop_start
         sleep_time = max(0, CAPTURE_INTERVAL - elapsed)
         time.sleep(sleep_time)
 
-    cap.release()
     print("Perception stopped.")
 
 if __name__ == "__main__":
