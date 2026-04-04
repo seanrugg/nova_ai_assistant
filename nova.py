@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
 """
-Nova - AI Companion for the Rugge Family
-Runs on Jetson Orin Nano with Ollama (gemma4:e2b), Faster-Whisper STT, and Piper TTS.
+Nova - AI companion for the Rugge family
+Runs on Jetson Orin Nano with Ollama (gemma3:4b), Faster-Whisper STT, and Piper TTS.
 
 Hardware:
-  - Mic:    Microsoft LifeCam Cinema  (ALSA plughw:0,0)
+  - Mic:    Microsoft LifeCam Cinema (PulseAudio via parec)
+  - Audio:  DisplayPort monitor speakers (PulseAudio default sink)
   - Camera: /dev/video0 (Microsoft LifeCam Cinema)
-  - Audio:  DisplayPort monitor speakers (hw:1,3)
 
 Usage:
-  python3 nova.py                  # Vision-based speaker identification (default)
-  python3 nova.py --user devyn     # Override: skip vision, load Devyn's profile
-  python3 nova.py --user sean
-  python3 nova.py --user jihan
-  python3 nova.py --user dahna
-  python3 nova.py --user yumi
-  python3 nova.py --user unknown   # Generic visitor mode
+  python3 nova.py                # vision-based speaker ID
+  python3 nova.py --user sean    # skip vision, identify as Sean
 
-Family config: ~/nova_config/family_config.py  (private — not in GitHub repo)
 Press Ctrl+C to exit.
 """
 
+import argparse
 import subprocess
 import tempfile
 import os
@@ -31,284 +26,308 @@ import time
 import urllib.request
 import urllib.error
 import json
-import argparse
 import base64
-import importlib.util
-from pathlib import Path
+import signal
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-# FIX 1: Use plughw instead of hw — allows ALSA to do format/rate conversion.
-# hw:0,0 is strict and can fail silently if the device is busy or rate mismatches.
-MIC_DEVICE        = "plughw:0,0"
-MIC_RATE          = 16000
-MIC_CHANNELS      = 1
-MIC_FORMAT        = "S16_LE"
-RECORD_SECONDS    = 5
+# Mic — PulseAudio via parec (confirmed working on JetPack 6.2.2 / NVMe boot)
+MIC_SOURCE        = "alsa_input.usb-Microsoft_Microsoft___LifeCam_Cinema_TM_-02.mono-fallback"
+MIC_RATE          = 16000            # Hz — Whisper native rate
+MIC_CHANNELS      = 1               # Mono
 
-PIPER_BIN         = os.path.expanduser("~/.local/bin/piper")
-PIPER_VOICE       = os.path.expanduser("~/piper-voices/en_GB-alba-medium.onnx")
-PIPER_RATE        = 22050
+# Smart listening — silence detection
+CHUNK_SECONDS      = 0.5            # Record in 0.5s chunks
+MAX_LISTEN_SECONDS = 30             # Never listen longer than this
+SILENCE_SECONDS    = 1.5            # Stop after this much silence post-speech
+SPEECH_THRESHOLD   = 300            # RMS above this = speech detected
+SILENCE_THRESHOLD  = 200            # RMS below this = silence
 
-OLLAMA_URL        = "http://localhost:11434/api/chat"
-OLLAMA_MODEL      = "gemma4:e2b"
+# Speaker — PulseAudio default sink (no explicit device — works with DP monitor)
+PIPER_BIN        = os.path.expanduser("~/.local/bin/piper")
+PIPER_VOICE      = os.path.expanduser("~/piper-voices/en_GB-alba-medium.onnx")
+PIPER_RATE       = 22050             # Hz — Alba medium sample rate
 
-WHISPER_MODEL     = "base"
-SILENCE_THRESHOLD = 500
+# Ollama
+OLLAMA_URL       = "http://localhost:11434/api/chat"
+OLLAMA_MODEL     = "gemma3:4b"
 
-CAMERA_DEVICE     = "/dev/video0"
-VISION_SNAPSHOT   = "/tmp/nova_vision.jpg"
+# Whisper
+WHISPER_MODEL    = "base"
+
+Hardware:
+  - Mic:    Microsoft LifeCam Cinema (PulseAudio via parec)
+  - Audio:  DisplayPort monitor speakers (PulseAudio default sink)
+  - Camera: /dev/video0 (Microsoft LifeCam Cinema)
+
+Usage:
+  python3 nova.py                # vision-based speaker ID
+  python3 nova.py --user sean    # skip vision, identify as Sean
+
+Press Ctrl+C to exit.
+"""
+
+import argparse
+import subprocess
+import tempfile
+import os
+import sys
+import wave
+import struct
+import time
+import urllib.request
+import urllib.error
+import json
+import base64
+import signal
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+# Mic — PulseAudio via parec (confirmed working on JetPack 6.2.2 / NVMe boot)
+MIC_SOURCE       = "alsa_input.usb-Microsoft_Microsoft___LifeCam_Cinema_TM_-02.mono-fallback"
+MIC_RATE         = 16000             # Hz — Whisper native rate
+MIC_CHANNELS     = 1                 # Mono
+RECORD_SECONDS   = 5                 # How long to listen each turn
+
+# Speaker — PulseAudio default sink (no explicit device — works with DP monitor)
+PIPER_BIN        = os.path.expanduser("~/.local/bin/piper")
+PIPER_VOICE      = os.path.expanduser("~/piper-voices/en_GB-alba-medium.onnx")
+PIPER_RATE       = 22050             # Hz — Alba medium sample rate
+
+# Ollama
+OLLAMA_URL       = "http://localhost:11434/api/chat"
+OLLAMA_MODEL     = "gemma4:e2b"      # Vision-capable
+
+# Whisper
+WHISPER_MODEL    = "base"
+
+# Audio thresholds
+SILENCE_THRESHOLD = 300              # RMS below this = silence, skip turn
+
+# Camera
+CAMERA_DEVICE    = "/dev/video0"
+
+# Family config location (private — never commit to GitHub)
+FAMILY_CONFIG_PATH = os.path.expanduser("~/nova_config/family_config.py")
 
 # ─── Load family config ───────────────────────────────────────────────────────
 
 def load_family_config():
-    """Load private family config if present, otherwise return None."""
-    config_path = Path.home() / "nova_config" / "family_config.py"
-    try:
-        spec = importlib.util.spec_from_file_location("family_config", config_path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        print(f"✅ Family config loaded from {config_path}")
-        return mod
-    except FileNotFoundError:
-        print(f"ℹ️  No family config found at {config_path} — running in generic mode")
+    """Load family config from private file."""
+    if not os.path.exists(FAMILY_CONFIG_PATH):
+        print(f"⚠️  Family config not found at {FAMILY_CONFIG_PATH}")
+        print("   Running with default Nova identity only.")
         return None
-    except Exception as e:
-        print(f"⚠️  Family config error: {e} — running in generic mode")
-        return None
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("family_config", FAMILY_CONFIG_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
+# ─── Build system prompt ──────────────────────────────────────────────────────
 
-def get_member_by_name(family_config, name):
-    """Look up a family member by name or alias (case-insensitive)."""
-    if not family_config:
-        return None
-    name_lower = name.lower().strip()
-    for member in family_config.FAMILY_MEMBERS:
-        if member["name"].lower() == name_lower:
-            return member
-        if any(alias.lower() == name_lower for alias in member.get("aliases", [])):
-            return member
-    return None
-
-
-def build_system_prompt(family_config, member):
-    """Build a complete system prompt for the identified family member."""
-    if not family_config:
-        return GENERIC_SYSTEM_PROMPT
+def build_system_prompt(family_config, member_name=None):
+    """Build Nova's system prompt for the given family member."""
+    if family_config is None:
+        return """You are Nova, a friendly AI companion. Be warm, helpful, and concise."""
 
     identity = family_config.NOVA_IDENTITY.strip()
+
+    if member_name is None:
+        profile = family_config.UNKNOWN_VISITOR_PROFILE.strip()
+        style = family_config.PERSONAS["adult"]["style"].strip()
+        return f"{identity}\n\n{style}\n\n{profile}"
+
+    member = next(
+        (m for m in family_config.FAMILY_MEMBERS
+         if m["name"].lower() == member_name.lower()),
+        None
+    )
 
     if member is None:
         profile = family_config.UNKNOWN_VISITOR_PROFILE.strip()
         style = family_config.PERSONAS["adult"]["style"].strip()
-        return f"{identity}\n\n---\n\n{style}\n\n---\n\n{profile}"
+        return f"{identity}\n\n{style}\n\n{profile}"
 
-    persona_key = member.get("persona", "adult")
-    persona = family_config.PERSONAS.get(persona_key, family_config.PERSONAS["adult"])
+    persona = family_config.PERSONAS.get(member["persona"], family_config.PERSONAS["adult"])
     style = persona["style"].strip()
     profile = member["profile"].strip()
-    name = member["name"]
 
-    return (
-        f"{identity}\n\n"
-        f"---\n\n"
-        f"You are currently speaking with {name}. Here is what you know about them:\n\n"
-        f"{profile}\n\n"
-        f"---\n\n"
-        f"Interaction style for this conversation:\n{style}"
-    )
+    return f"{identity}\n\n{style}\n\n{profile}"
+
+# ─── Audio recording via parec ────────────────────────────────────────────────
+
+def chunk_rms(data):
+    """Calculate RMS of raw s16le bytes."""
+    if len(data) < 2:
+        return 0
+    samples = struct.unpack(f"{len(data)//2}h", data[:len(data)//2*2])
+    return (sum(s * s for s in samples) / len(samples)) ** 0.5
 
 
-# ─── Generic fallback prompt (no family config) ───────────────────────────────
+def record_audio(raw_file):
+    """
+    Record audio from LifeCam via PulseAudio parec using smart silence detection.
+    Listens until speech is detected, then stops after SILENCE_SECONDS of silence.
+    """
+    print("🎤 Listening...")
+    bytes_per_chunk = int(MIC_RATE * MIC_CHANNELS * 2 * CHUNK_SECONDS)
+    silence_chunks_needed = int(SILENCE_SECONDS / CHUNK_SECONDS)
+    max_chunks = int(MAX_LISTEN_SECONDS / CHUNK_SECONDS)
 
-GENERIC_SYSTEM_PROMPT = """You are Nova, a warm and friendly AI companion.
-You are helpful, curious, and genuinely care about the people you talk with.
-Adapt your tone to the person — playful with children, natural and direct with adults.
-Keep responses appropriately concise. Ask follow-up questions to stay engaged.
-"""
+    cmd = [
+        "parec",
+        "-d", MIC_SOURCE,
+        f"--rate={MIC_RATE}",
+        f"--channels={MIC_CHANNELS}",
+        "--format=s16le",
+    ]
+
+    all_audio = bytearray()
+    speech_detected = False
+    silence_count = 0
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    try:
+        for _ in range(max_chunks):
+            chunk = proc.stdout.read(bytes_per_chunk)
+            if not chunk:
+                break
+            rms = chunk_rms(chunk)
+            all_audio.extend(chunk)
+
+            if rms >= SPEECH_THRESHOLD:
+                if not speech_detected:
+                    print("   💬 Speech detected...")
+                speech_detected = True
+                silence_count = 0
+            elif speech_detected:
+                silence_count += 1
+                if silence_count >= silence_chunks_needed:
+                    print("   ✋ End of speech detected")
+                    break
+    finally:
+        proc.terminate()
+        proc.wait()
+
+    if not speech_detected:
+        return False
+
+    with open(raw_file, "wb") as f:
+        f.write(all_audio)
+
+    rms_total = chunk_rms(bytes(all_audio))
+    print(f"   Audio RMS: {rms_total:.0f}")
+    return os.path.getsize(raw_file) > 0
+
+
+def raw_to_wav(raw_file, wav_file):
+    """Convert raw s16le file to wav for Whisper."""
+    with open(raw_file, "rb") as f:
+        raw_data = f.read()
+    with wave.open(wav_file, "wb") as wf:
+        wf.setnchannels(MIC_CHANNELS)
+        wf.setsampwidth(2)  # 16-bit = 2 bytes
+        wf.setframerate(MIC_RATE)
+        wf.writeframes(raw_data)
+
+
+def is_silent(raw_file, threshold=SILENCE_THRESHOLD):
+    """Return True if the recording is basically silence."""
+    try:
+        with open(raw_file, "rb") as f:
+            data = f.read()
+        if len(data) < 2:
+            return True
+        samples = struct.unpack(f"{len(data)//2}h", data[:len(data)//2*2])
+        rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
+        print(f"   Audio RMS: {rms:.0f} (threshold: {threshold})")
+        return rms < threshold
+    except Exception as e:
+        print(f"   Warning: could not check silence: {e}")
+        return True
 
 # ─── Vision identification ────────────────────────────────────────────────────
 
-def capture_frame(output_path=VISION_SNAPSHOT):
-    """Capture a single frame from the webcam using ffmpeg."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "v4l2",
-        "-i", CAMERA_DEVICE,
-        "-frames:v", "1",
-        "-q:v", "2",
-        output_path
-    ]
-    result = subprocess.run(cmd, capture_output=True)
-    return result.returncode == 0 and os.path.exists(output_path)
+def capture_image(path):
+    """Capture a single frame from the LifeCam."""
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-f", "v4l2", "-i", CAMERA_DEVICE,
+         "-frames:v", "1", "-q:v", "2", path],
+        capture_output=True
+    )
+    return result.returncode == 0 and os.path.exists(path)
 
 
-def image_to_base64(path):
-    """Read an image file and return base64-encoded string."""
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
-
-
-def identify_person_via_vision(family_config):
-    """
-    Capture a frame and ask gemma4:e2b to identify who is in the image.
-    Returns a family member dict, or None for unknown.
-
-    FIX 2: Ollama's multimodal API requires images to be passed in the
-    content array as image_url objects, not as a top-level 'images' key.
-    The old format caused HTTP 500 on newer Ollama builds with gemma4.
-    """
-    if not family_config:
+def identify_person(family_config):
+    """Use gemma4:e2b vision to identify who is speaking."""
+    if family_config is None:
         return None
 
-    print("📷 Capturing image for identification...")
-    if not capture_frame():
-        print("   ⚠️  Camera capture failed — skipping vision ID")
-        return None
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+        img_path = f.name
 
     try:
-        img_b64 = image_to_base64(VISION_SNAPSHOT)
-    except Exception as e:
-        print(f"   ⚠️  Could not read image: {e}")
-        return None
+        if not capture_image(img_path):
+            print("   ⚠️  Camera capture failed")
+            return None
 
-    # Build name list for the prompt
-    names = [m["name"] for m in family_config.FAMILY_MEMBERS]
-    names_str = ", ".join(names)
+        with open(img_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-    prompt_text = (
-        f"Look at this image carefully. The person in the image is a member of the Rugge family. "
-        f"Their names are: {names_str}. "
-        f"Reply with ONLY the single first name of the person you see, exactly as listed. "
-        f"If you cannot identify them or no person is clearly visible, reply with exactly: Unknown"
-    )
+        names = [m["name"] for m in family_config.FAMILY_MEMBERS]
+        name_list = ", ".join(names)
+        prompt_text = (
+            f"Look at the person in this image. The possible people are: {name_list}. "
+            f"Reply with ONLY the person's first name from that list, or 'unknown' if you cannot tell. "
+            f"Do not explain. Just one word."
+        )
 
-    # FIX: Use content array format with image_url — required for Ollama multimodal
-    payload = json.dumps({
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{img_b64}"
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt_text
-                    }
-                ]
-            }
-        ],
-        "stream": False
-    }).encode("utf-8")
+        # Ollama native vision format — content as plain string, images as parallel key
+        payload = json.dumps({
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt_text,
+                    "images": [img_b64]
+                }
+            ],
+            "stream": False
+        }).encode("utf-8")
 
-    req = urllib.request.Request(
-        OLLAMA_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
+        req = urllib.request.Request(
+            OLLAMA_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            raw = data["message"]["content"].strip()
-            print(f"   Vision result: '{raw}'")
+            name = data["message"]["content"].strip().lower()
+            # Match against known names
+            for member in family_config.FAMILY_MEMBERS:
+                if member["name"].lower() in name:
+                    print(f"👤 Identified: {member['name']}")
+                    return member["name"]
+            print(f"   Vision returned: {name} — treating as unknown")
+            return None
 
-            # Clean up the response — model sometimes adds punctuation
-            identified_name = raw.strip(".,!? ").split()[0] if raw else "Unknown"
-
-            if identified_name.lower() == "unknown":
-                return None
-
-            member = get_member_by_name(family_config, identified_name)
-            if member:
-                print(f"   ✅ Identified: {member['name']}")
-                return member
-            else:
-                print(f"   ⚠️  '{identified_name}' not matched in family config")
-                return None
-
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        print(f"   ⚠️  Vision HTTP {e.code}: {body[:300]}")
-        return None
     except Exception as e:
-        print(f"   ⚠️  Vision identification error: {e}")
+        print(f"   Vision ID error: {e}")
         return None
+    finally:
+        try:
+            os.unlink(img_path)
+        except Exception:
+            pass
 
-
-def confirm_identification(member, speak_fn, whisper_model):
-    """
-    Ask Nova to confirm identification aloud. Returns True if confirmed,
-    False if the person says no (triggering a fallback ask).
-
-    FIX 3: Accept whisper_model as parameter instead of reloading it.
-    """
-    name = member["name"]
-    speak_fn(f"Oh! Is that you, {name}?")
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        tmp = f.name
-
-    if not record_audio(tmp, seconds=4):
-        os.unlink(tmp)
-        return True  # assume yes on capture failure
-
-    try:
-        segments, _ = whisper_model.transcribe(tmp, language="en")
-        response = " ".join(s.text.strip() for s in segments).strip().lower()
-        os.unlink(tmp)
-        print(f"   Confirmation response: '{response}'")
-        if any(word in response for word in ["no", "nope", "not", "wrong", "nah"]):
-            return False
-        return True
-    except Exception:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        return True
-
-
-# ─── Audio helpers ────────────────────────────────────────────────────────────
-
-def record_audio(filename, seconds=RECORD_SECONDS):
-    """Record audio from the mic using arecord."""
-    print(f"🎤 Listening for {seconds} seconds...")
-    cmd = [
-        "arecord",
-        "-D", MIC_DEVICE,
-        "-f", MIC_FORMAT,
-        "-r", str(MIC_RATE),
-        "-c", str(MIC_CHANNELS),
-        "-d", str(seconds),
-        filename
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"   arecord error: {result.stderr.strip()}")
-    return result.returncode == 0
-
-
-def is_silent(filename, threshold=SILENCE_THRESHOLD):
-    """Return True if the recording is basically silence."""
-    try:
-        with wave.open(filename, "rb") as wf:
-            frames = wf.readframes(wf.getnframes())
-            samples = struct.unpack(f"{len(frames)//2}h", frames)
-            rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
-            print(f"   Audio RMS: {rms:.0f} (threshold: {threshold})")
-            return rms < threshold
-    except Exception as e:
-        print(f"   Warning: could not check silence: {e}")
-        return False
-
+# ─── TTS via Piper ────────────────────────────────────────────────────────────
 
 def speak(text):
-    """Convert text to speech using Piper and play via aplay."""
+    """Convert text to speech using Piper and play via aplay (PulseAudio default)."""
     print(f"🔊 Nova: {text}")
     try:
         piper_cmd = [
@@ -316,9 +335,9 @@ def speak(text):
             "--model", PIPER_VOICE,
             "--output_raw"
         ]
+        # No -D flag — let PulseAudio route to default sink automatically
         aplay_cmd = [
             "aplay",
-            "-D", "hw:1,3",
             "-r", str(PIPER_RATE),
             "-f", "S16_LE",
             "-c", "1"
@@ -342,8 +361,7 @@ def speak(text):
     except Exception as e:
         print(f"   TTS error: {e}")
 
-
-# ─── Ollama ───────────────────────────────────────────────────────────────────
+# ─── Ollama chat ──────────────────────────────────────────────────────────────
 
 def ask_ollama(messages):
     """Send conversation to Ollama and return Nova's reply."""
@@ -365,7 +383,7 @@ def ask_ollama(messages):
             return data["message"]["content"].strip()
     except Exception as e:
         print(f"   Ollama error: {e}")
-        return "I had a little hiccup there. Could you say that again?"
+        return "I had a little hiccup. Can you say that again?"
 
 
 def check_ollama():
@@ -376,169 +394,134 @@ def check_ollama():
     except Exception:
         return False
 
-
-# ─── Greeting ─────────────────────────────────────────────────────────────────
-
-def build_greeting(member):
-    """Return an appropriate greeting for the identified person."""
-    if member is None:
-        return "Hello! I'm Nova. I don't think we've met — what's your name?"
-
-    name = member["name"]
-    persona = member.get("persona", "adult")
-    nickname = member.get("aliases", [name])[0] if member.get("aliases") else name
-
-    if persona == "child":
-        return f"Hi {nickname}! It's me, Nova! Beep boop! What do you want to talk about today?"
-    elif persona == "teen":
-        return f"Hey {name}! Good to see you. What's going on?"
-    else:
-        return f"Hello {name}. Nova here — what's on your mind?"
-
-
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Nova AI Companion")
-    parser.add_argument(
-        "--user",
-        type=str,
-        default=None,
-        help="Override vision ID — specify family member name (devyn, jihan, dahna, yumi, sean, unknown)"
-    )
+    parser.add_argument("--user", type=str, default=None,
+                        help="Skip vision ID and use this family member name directly")
     args = parser.parse_args()
 
     print("=" * 55)
-    print("  Nova — AI Companion")
+    print("  Nova — Rugge Family AI Companion")
     print("  Press Ctrl+C to exit")
     print("=" * 55)
 
-    # Startup checks
+    # Check Ollama
     if not check_ollama():
         print("❌ Ollama is not running. Start it with: ollama serve")
         sys.exit(1)
     print("✅ Ollama connected")
 
+    # Check Piper
     if not os.path.exists(PIPER_BIN):
         print(f"❌ Piper not found at {PIPER_BIN}")
         sys.exit(1)
     print("✅ Piper ready")
 
+    # Check voice model
     if not os.path.exists(PIPER_VOICE):
         print(f"❌ Voice model not found at {PIPER_VOICE}")
         sys.exit(1)
-    print("✅ Voice model ready")
+    print("✅ Voice model ready (Alba)")
 
     # Load family config
     family_config = load_family_config()
+    if family_config:
+        names = [m["name"] for m in family_config.FAMILY_MEMBERS]
+        print(f"✅ Family config loaded ({', '.join(names)})")
+    else:
+        print("⚠️  Running without family config")
 
-    # Load Whisper once — passed to all functions that need it
+    # Identify user
+    if args.user:
+        current_user = args.user.capitalize()
+        print(f"✅ User set via --user: {current_user}")
+    else:
+        print("📷 Identifying speaker via vision...")
+        current_user = identify_person(family_config)
+        if current_user is None:
+            print("   Could not identify — using unknown visitor profile")
+
+    # Build system prompt
+    system_prompt = build_system_prompt(family_config, current_user)
+
+    # Load Whisper
     print("⏳ Loading speech recognition model...")
     try:
         from faster_whisper import WhisperModel
         whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-        print("✅ Whisper ready")
+        print("✅ Whisper ready\n")
     except Exception as e:
         print(f"❌ Could not load Whisper: {e}")
         sys.exit(1)
 
-    print()
-
-    # ── Identify speaker ──
-    member = None
-
-    if args.user:
-        # Manual override
-        if args.user.lower() == "unknown":
-            member = None
-            print("ℹ️  Running in unknown visitor mode (manual override)")
-        else:
-            member = get_member_by_name(family_config, args.user)
-            if member:
-                print(f"ℹ️  User override: {member['name']}")
-            else:
-                print(f"⚠️  '{args.user}' not found in family config — running as unknown visitor")
+    # Greeting
+    if current_user:
+        greeting = f"Hello {current_user}! Nova here — what's on your mind?"
     else:
-        # Vision identification
-        if family_config and os.path.exists(CAMERA_DEVICE):
-            member = identify_person_via_vision(family_config)
-            if member:
-                # FIX: Pass whisper_model instead of reloading inside confirm_identification
-                confirmed = confirm_identification(member, speak, whisper_model)
-                if not confirmed:
-                    speak("Sorry about that! Who am I talking to?")
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                        tmp = f.name
-                    if record_audio(tmp, seconds=4):
-                        segments, _ = whisper_model.transcribe(tmp, language="en")
-                        name_said = " ".join(s.text.strip() for s in segments).strip()
-                        os.unlink(tmp)
-                        member = get_member_by_name(family_config, name_said.split()[0] if name_said else "")
-                    else:
-                        os.unlink(tmp)
-                        member = None
-        else:
-            print("ℹ️  No camera or family config — running in generic mode")
-
-    # ── Build system prompt for this person ──
-    system_prompt = build_system_prompt(family_config, member)
-
-    # ── Greet ──
-    greeting = build_greeting(member)
-    messages = [{"role": "system", "content": system_prompt}]
+        greeting = "Hello! I'm Nova. I don't think we've met — what's your name?"
     speak(greeting)
-    messages.append({"role": "assistant", "content": greeting})
 
-    print()
+    # Conversation history
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "assistant", "content": greeting}
+    ]
 
-    # ── Conversation loop ──
+    # Main loop
     while True:
         try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                tmp_audio = f.name
+            with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as f:
+                tmp_raw = f.name
+            tmp_wav = tmp_raw.replace(".raw", ".wav")
 
-            if not record_audio(tmp_audio):
-                print("   Recording failed, retrying...")
-                time.sleep(1)
+            # Record — returns False if no speech detected
+            if not record_audio(tmp_raw):
+                print("   (no speech detected — listening again...)\n")
+                try:
+                    os.unlink(tmp_raw)
+                except Exception:
+                    pass
                 continue
 
-            if is_silent(tmp_audio):
-                print("   (silence — listening again...)\n")
-                os.unlink(tmp_audio)
-                continue
+            # Convert to wav for Whisper
+            raw_to_wav(tmp_raw, tmp_wav)
+            os.unlink(tmp_raw)
 
+            # Transcribe
             print("💭 Thinking...")
-            segments, _ = whisper_model.transcribe(tmp_audio, language="en")
+            segments, _ = whisper_model.transcribe(tmp_wav, language="en")
             user_text = " ".join(seg.text.strip() for seg in segments).strip()
-            os.unlink(tmp_audio)
+            os.unlink(tmp_wav)
 
             if not user_text:
                 print("   (nothing heard — listening again...)\n")
                 continue
 
-            # Label the speaker in the log
-            speaker_label = member["name"] if member else "Visitor"
-            print(f"👤 {speaker_label}: {user_text}")
+            print(f"👤 {current_user or 'Visitor'}: {user_text}")
 
+            # Add to conversation
             messages.append({"role": "user", "content": user_text})
+
+            # Get reply
             reply = ask_ollama(messages)
             messages.append({"role": "assistant", "content": reply})
 
+            # Speak
             speak(reply)
             print()
 
-            # Trim history: keep system prompt + last 20 turns
-            if len(messages) > 21:
+            # Trim history (system + last 20 turns)
+            if len(messages) > 22:
                 messages = [messages[0]] + messages[-20:]
 
         except KeyboardInterrupt:
-            farewell = "Goodbye! Talk to you soon."
-            if member and member.get("persona") == "child":
-                farewell = "Bye bye! See you soon! Beep boop!"
-            elif member and member.get("persona") == "teen":
-                farewell = f"Later, {member['name']}. Take care."
-            print(f"\n\n👋 {farewell}")
-            speak(farewell)
+            print("\n\n👋 Nova is going to sleep. Goodbye!")
+            if current_user:
+                speak(f"Goodbye {current_user}! Talk soon!")
+            else:
+                speak("Goodbye! Come talk to me again soon!")
             break
         except Exception as e:
             print(f"   Unexpected error: {e}")
