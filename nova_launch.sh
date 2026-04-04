@@ -18,6 +18,7 @@ echo "🚀 Starting Nova..."
 # ── Jetson: pin clocks for inference performance ───────────────────────────────
 JETSON_CLOCKS_ACTIVE=false
 if command -v jetson_clocks &>/dev/null; then
+    rm -f "$JETSON_CLOCKS_RESTORE"
     sudo jetson_clocks --store "$JETSON_CLOCKS_RESTORE"
     sudo jetson_clocks
     JETSON_CLOCKS_ACTIVE=true
