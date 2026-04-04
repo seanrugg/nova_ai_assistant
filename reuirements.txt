@@ -1,1 +1,10 @@
-faster-whisper
+# Nova AI Companion — Python dependencies
+# Install with: pip install -r requirements.txt
+#
+# Note: Ollama and Piper TTS are installed separately — see README.md
+
+faster-whisper==1.2.1
+huggingface-hub==1.9.0
+numpy==2.2.6
+onnxruntime==1.23.2
+tokenizers==0.22.2
