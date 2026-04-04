@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+.venv
+env/
+venv/
+
+# Temp files
+*.log
+*.tmp
+/tmp/
+
+# Audio/model artifacts
+*.wav
+*.raw
+*.onnx
+*.onnx.json
+
+# Jetson clock save file
+nova_clocks_restore
+
+# OS
+.DS_Store
+Thumbs.db
