@@ -297,23 +297,67 @@ def speak(text):
 
 # ── Ollama ────────────────────────────────────────────────────────────────────
 
-def ask_ollama(messages):
+# Sentence-ending punctuation used to split the stream into speakable chunks
+SENTENCE_ENDINGS = {'.', '!', '?'}
+
+
+def ask_ollama_streaming(messages):
+    """
+    Stream tokens from Ollama. Speak each sentence as it completes.
+    Returns the full response text for conversation history.
+    """
     payload = json.dumps({
         "model": OLLAMA_MODEL,
         "messages": messages,
-        "stream": False
+        "stream": True
     }).encode("utf-8")
     req = urllib.request.Request(
         OLLAMA_URL, data=payload,
         headers={"Content-Type": "application/json"}, method="POST"
     )
+    full_reply = ""
+    buffer = ""
+
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["message"]["content"].strip()
+            for raw_line in resp:
+                line = raw_line.decode("utf-8").strip()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                token = chunk.get("message", {}).get("content", "")
+                if not token:
+                    continue
+
+                buffer += token
+                full_reply += token
+
+                # Speak when we hit a sentence boundary followed by a space
+                # (avoids splitting on e.g. "Mr." or "3.5")
+                if any(buffer.rstrip().endswith(p) for p in SENTENCE_ENDINGS):
+                    sentence = buffer.strip()
+                    if sentence:
+                        speak(sentence)
+                    buffer = ""
+
+                if chunk.get("done", False):
+                    break
+
+        # Speak any remaining buffer (response didn't end with punctuation)
+        if buffer.strip():
+            speak(buffer.strip())
+
     except Exception as e:
         print(f"   Ollama error: {e}")
-        return "I had a little hiccup. Can you say that again?"
+        fallback = "I had a little hiccup. Can you say that again?"
+        speak(fallback)
+        return fallback
+
+    return full_reply.strip()
 
 
 def check_ollama():
@@ -433,10 +477,10 @@ def main():
             print(f"{current_user or 'Visitor'}: {user_text}")
             messages.append({"role": "user", "content": user_text})
 
-            reply = ask_ollama(messages)
+            print("Nova: ", end="", flush=True)
+            reply = ask_ollama_streaming(messages)
+            print()  # newline after streamed output
             messages.append({"role": "assistant", "content": reply})
-
-            speak(reply)
             print()
 
             if len(messages) > 22:
