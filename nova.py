@@ -29,6 +29,7 @@ import urllib.request
 import urllib.error
 import json
 import base64
+import re
 import importlib.util
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -276,7 +277,22 @@ def identify_person(family_config):
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
 
+def clean_for_speech(text):
+    """Strip markdown and symbols that TTS would read aloud awkwardly."""
+    # Remove bold and italic markers (**text**, *text*, __text__, _text_)
+    text = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', text)
+    text = re.sub(r'_{1,2}([^_]+)_{1,2}', r'\1', text)
+    # Remove standalone asterisks, hashes, backticks
+    text = re.sub(r'[*#`]', '', text)
+    # Remove markdown links [text](url) → text
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+    # Collapse multiple spaces
+    text = re.sub(r' {2,}', ' ', text)
+    return text.strip()
+
+
 def speak(text):
+    text = clean_for_speech(text)
     print(f"Nova: {text}")
     try:
         piper_proc = subprocess.Popen(
