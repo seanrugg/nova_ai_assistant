@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 perception.py — Nova's visual awareness engine
-Runs on the Coral TPU via coral_env venv.
+Runs via coral_env venv (for tflite compatibility).
 
-Captures frames from the LifeCam using ffmpeg, runs person and object
-detection on the Coral TPU, and writes structured environment observations
-to a shared JSON file that nova.py reads periodically.
+Captures frames from the LifeCam every CAPTURE_INTERVAL seconds,
+sends them to Ollama's vision model for rich scene description,
+and writes the result to ~/.nova_perception.json for nova.py to read.
 
 Usage:
     ~/coral_env/bin/python3 perception.py
@@ -14,13 +14,11 @@ Output:
     ~/.nova_perception.json  — updated every CAPTURE_INTERVAL seconds
 
 Dependencies (coral_env):
-    tflite-runtime==2.17.0
-    numpy==1.26.4
     Pillow
 
 System dependencies (already installed):
     ffmpeg
-    libedgetpu.so.1
+    Ollama (gemma3:4b with vision)
 """
 
 import json
@@ -30,179 +28,88 @@ import time
 import signal
 import subprocess
 import tempfile
+import base64
+import urllib.request
 from datetime import datetime
 
-import numpy as np
-import tflite_runtime.interpreter as tflite
 from PIL import Image
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-CAMERA_DEVICE        = "/dev/video0"
-CAPTURE_INTERVAL     = 5.0               # seconds between perception updates
-CONFIDENCE_THRESHOLD = 0.45             # minimum detection confidence
-MAX_DETECTIONS       = 5                # max objects to report per frame
-INPUT_SIZE           = 300              # SSD MobileNet input size
+CAMERA_DEVICE    = "/dev/video0"
+CAPTURE_INTERVAL = 30.0              # seconds between vision updates
+OUTPUT_PATH      = os.path.expanduser("~/.nova_perception.json")
+OLLAMA_URL       = "http://localhost:11434/api/generate"
+OLLAMA_MODEL     = "gemma3:4b"
 
-MODEL_DIR    = os.path.expanduser("~/coral_models")
-MODEL_PATH   = os.path.join(MODEL_DIR, "ssd_mobilenet_v2_coco_quant_postprocess_edgetpu.tflite")
-CPU_MODEL    = os.path.join(MODEL_DIR, "ssd_mobilenet_v2_coco_quant_postprocess.tflite")
-LABELS_PATH  = os.path.join(MODEL_DIR, "coco_labels.txt")
-OUTPUT_PATH  = os.path.expanduser("~/.nova_perception.json")
-EDGETPU_LIB  = "libedgetpu.so.1"
-
-# Objects meaningful to report in a home/barn environment
-RELEVANT_LABELS = {
-    "person", "cat", "dog", "laptop", "cell phone", "book",
-    "cup", "bottle", "chair", "couch", "tv", "keyboard",
-    "mouse", "remote", "backpack", "sports ball", "bicycle"
-}
-
-# ── Load labels ───────────────────────────────────────────────────────────────
-
-def load_labels(path):
-    with open(path, "r") as f:
-        lines = f.read().splitlines()
-    labels = {}
-    for line in lines:
-        parts = line.strip().split(None, 1)
-        if not parts:
-            continue
-        # Format: "0 person"
-        if len(parts) == 2 and parts[0].isdigit():
-            labels[int(parts[0])] = parts[1]
-        # Format: "person" — label only
-        else:
-            labels[len(labels)] = parts[0]
-    return labels
-
-# ── Load model ────────────────────────────────────────────────────────────────
-
-def load_model():
-    """Try Coral TPU first, fall back to CPU."""
-    try:
-        delegate = tflite.load_delegate(EDGETPU_LIB)
-        interpreter = tflite.Interpreter(
-            model_path=MODEL_PATH,
-            experimental_delegates=[delegate]
-        )
-        interpreter.allocate_tensors()
-        print("✅ Coral TPU loaded")
-        return interpreter, True
-    except Exception as e:
-        print(f"⚠️  Coral TPU unavailable ({e}) — falling back to CPU")
-        try:
-            interpreter = tflite.Interpreter(model_path=CPU_MODEL)
-            interpreter.allocate_tensors()
-            print("✅ CPU model loaded")
-            return interpreter, False
-        except Exception as e2:
-            print(f"❌ CPU model also failed: {e2}")
-            sys.exit(1)
+VISION_PROMPT = (
+    "You are Nova's eyes. Describe what you see in this image in 2-3 sentences. "
+    "Be specific and factual — mention people, objects, lighting, and activity. "
+    "Do not speculate about things you cannot see. "
+    "Write as if giving a quiet, observant report to Nova so she can be aware of her surroundings."
+)
 
 # ── Capture frame ─────────────────────────────────────────────────────────────
 
 def capture_frame():
-    """Capture a single frame from the camera using ffmpeg. Returns PIL Image or None."""
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-        tmp_path = f.name
+    """Capture a single JPEG frame using ffmpeg. Returns path to temp file or None."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    tmp.close()
     try:
         result = subprocess.run([
             "ffmpeg", "-y",
             "-f", "v4l2",
             "-i", CAMERA_DEVICE,
             "-frames:v", "1",
-            "-q:v", "2",
-            tmp_path
+            "-q:v", "3",
+            tmp.name
         ], capture_output=True, timeout=10)
 
-        if result.returncode != 0 or not os.path.exists(tmp_path):
-            return None
-
-        img = Image.open(tmp_path).convert("RGB")
-        return img
-    except Exception as e:
-        print(f"Frame capture error: {e}")
+        if result.returncode == 0 and os.path.exists(tmp.name):
+            return tmp.name
         return None
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+    except Exception as e:
+        print(f"Capture error: {e}")
+        return None
 
-# ── Run inference ─────────────────────────────────────────────────────────────
+# ── Describe frame ────────────────────────────────────────────────────────────
 
-def run_inference(interpreter, image):
-    """Run object detection on a PIL image. Returns boxes, classes, scores."""
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
+def describe_frame(image_path):
+    """Send image to Ollama vision model. Returns description string or None."""
+    try:
+        with open(image_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-    # Resize to model input size
-    resized = image.resize((INPUT_SIZE, INPUT_SIZE), Image.BILINEAR)
-    input_data = np.expand_dims(np.array(resized, dtype=np.uint8), axis=0)
+        payload = json.dumps({
+            "model": OLLAMA_MODEL,
+            "prompt": VISION_PROMPT,
+            "images": [img_b64],
+            "stream": False
+        }).encode("utf-8")
 
-    interpreter.set_tensor(input_details[0]['index'], input_data)
-    interpreter.invoke()
+        req = urllib.request.Request(
+            OLLAMA_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
 
-    boxes   = interpreter.get_tensor(output_details[0]['index'])[0]
-    classes = interpreter.get_tensor(output_details[1]['index'])[0]
-    scores  = interpreter.get_tensor(output_details[2]['index'])[0]
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("response", "").strip()
 
-    return boxes, classes, scores
-
-# ── Build observation ─────────────────────────────────────────────────────────
-
-def build_observation(boxes, classes, scores, labels, using_tpu):
-    """Convert raw detections into a structured observation dict."""
-    detections = []
-    person_count = 0
-
-    for i in range(min(len(scores), MAX_DETECTIONS)):
-        if scores[i] < CONFIDENCE_THRESHOLD:
-            continue
-        label_id = int(classes[i])
-        label = labels.get(label_id, f"object_{label_id}")
-
-        if label not in RELEVANT_LABELS:
-            continue
-
-        if label == "person":
-            person_count += 1
-
-        detections.append({
-            "label": label,
-            "confidence": float(round(scores[i], 2)),
-        })
-
-    # Build natural language summary
-    if not detections:
-        summary = "The room appears empty — no people or notable objects detected."
-    else:
-        parts = []
-        if person_count == 1:
-            parts.append("1 person is present")
-        elif person_count > 1:
-            parts.append(f"{person_count} people are present")
-
-        objects = [d["label"] for d in detections if d["label"] != "person"]
-        if objects:
-            unique_objects = list(dict.fromkeys(objects))
-            parts.append(f"visible objects include: {', '.join(unique_objects)}")
-
-        summary = ". ".join(parts).capitalize() + "."
-
-    return {
-        "timestamp": datetime.now().isoformat(),
-        "using_tpu": using_tpu,
-        "person_count": person_count,
-        "detections": detections,
-        "summary": summary,
-    }
+    except Exception as e:
+        print(f"Vision error: {e}")
+        return None
 
 # ── Write output ──────────────────────────────────────────────────────────────
 
-def write_observation(observation):
-    """Atomic write to output file."""
+def write_observation(summary):
+    """Atomic write to output JSON file."""
+    observation = {
+        "timestamp": datetime.now().isoformat(),
+        "summary": summary,
+    }
     tmp = OUTPUT_PATH + ".tmp"
     with open(tmp, "w") as f:
         json.dump(observation, f, indent=2)
@@ -211,18 +118,6 @@ def write_observation(observation):
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
-    if not os.path.exists(MODEL_PATH):
-        print(f"Model not found: {MODEL_PATH}")
-        print("Run setup_coral_models.sh to download required models")
-        sys.exit(1)
-
-    if not os.path.exists(LABELS_PATH):
-        print(f"Labels not found: {LABELS_PATH}")
-        sys.exit(1)
-
-    labels = load_labels(LABELS_PATH)
-    interpreter, using_tpu = load_model()
-
     print(f"👁️  Perception running — interval: {CAPTURE_INTERVAL}s — output: {OUTPUT_PATH}")
 
     running = True
@@ -235,19 +130,26 @@ def main():
     while running:
         loop_start = time.time()
 
-        image = capture_frame()
-        if image is None:
+        image_path = capture_frame()
+        if image_path is None:
             print("Camera capture failed — retrying...")
-            time.sleep(2)
+            time.sleep(5)
             continue
 
         try:
-            boxes, classes, scores = run_inference(interpreter, image)
-            observation = build_observation(boxes, classes, scores, labels, using_tpu)
-            write_observation(observation)
-            print(f"[{observation['timestamp'][:19]}] {observation['summary']}")
+            description = describe_frame(image_path)
+            if description:
+                write_observation(description)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] {description[:80]}...")
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] No description returned")
         except Exception as e:
-            print(f"Inference error: {e}")
+            print(f"Error: {e}")
+        finally:
+            try:
+                os.unlink(image_path)
+            except Exception:
+                pass
 
         elapsed = time.time() - loop_start
         sleep_time = max(0, CAPTURE_INTERVAL - elapsed)
