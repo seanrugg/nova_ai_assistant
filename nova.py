@@ -32,6 +32,10 @@ import base64
 import re
 import importlib.util
 
+# ── Perception ────────────────────────────────────────────────────────────────
+PERCEPTION_OUTPUT   = os.path.expanduser("~/.nova_perception.json")
+PERCEPTION_MAX_AGE  = 30  # seconds — ignore stale observations
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # Mic — PulseAudio via parec (confirmed working on JetPack 6.2.2 / NVMe boot)
@@ -391,6 +395,23 @@ def check_ollama():
     except Exception:
         return False
 
+# ── Perception ────────────────────────────────────────────────────────────────
+
+def read_perception():
+    """Read the latest perception observation from perception.py output.
+    Returns a natural language string, or None if unavailable/stale."""
+    try:
+        if not os.path.exists(PERCEPTION_OUTPUT):
+            return None
+        age = time.time() - os.path.getmtime(PERCEPTION_OUTPUT)
+        if age > PERCEPTION_MAX_AGE:
+            return None
+        with open(PERCEPTION_OUTPUT, "r") as f:
+            data = json.load(f)
+        return data.get("summary")
+    except Exception:
+        return None
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -499,7 +520,14 @@ def main():
                 continue
 
             print(f"{current_user or 'Visitor'}: {user_text}")
-            messages.append({"role": "user", "content": user_text})
+
+            # Inject current perception context into user message if available
+            perception = read_perception()
+            if perception:
+                user_content = f"[Nova's current visual awareness: {perception}]\n\n{user_text}"
+            else:
+                user_content = user_text
+            messages.append({"role": "user", "content": user_content})
 
             reply = ask_ollama_streaming(messages)
             print()
