@@ -83,7 +83,7 @@ def load_family_config():
 
 def load_skills(skill_names, user_persona=None):
     """
-    Load skill modules by name from ~/nova_config/skills/.
+    Load skill modules by name from skills/.
     If user_persona is provided, filters to skills that list that persona
     (or skills with no persona filter at all).
     Returns list of loaded skill modules.
@@ -109,7 +109,7 @@ def load_skills(skill_names, user_persona=None):
                 continue
 
             loaded.append(mod)
-            print(f"Skill loaded: {getattr(mod, 'SKILL_NAME', name)}")
+            print(f"✅ Skill loaded: {getattr(mod, 'SKILL_NAME', name)}")
         except Exception as e:
             print(f"Warning: Could not load skill '{name}': {e}")
 
@@ -279,6 +279,10 @@ def identify_person(family_config):
 
 def clean_for_speech(text):
     """Strip markdown and symbols that TTS would read aloud awkwardly."""
+    # Strip leading "Nova:" prefix the model sometimes adds to its own responses
+    text = re.sub(r'^Nova:\s*', '', text, flags=re.IGNORECASE)
+    # Remove parenthetical stage directions e.g. (A quiet whirring sound)
+    text = re.sub(r'\([^)]*\)', '', text)
     # Remove bold and italic markers (**text**, *text*, __text__, _text_)
     text = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', text)
     text = re.sub(r'_{1,2}([^_]+)_{1,2}', r'\1', text)
@@ -293,6 +297,8 @@ def clean_for_speech(text):
 
 def speak(text):
     text = clean_for_speech(text)
+    if not text:
+        return
     print(f"Nova: {text}")
     try:
         piper_proc = subprocess.Popen(
@@ -352,20 +358,22 @@ def ask_ollama_streaming(messages):
                 buffer += token
                 full_reply += token
 
-                # Speak when we hit a sentence boundary followed by a space
-                # (avoids splitting on e.g. "Mr." or "3.5")
+                # Speak when we hit a sentence boundary
                 if any(buffer.rstrip().endswith(p) for p in SENTENCE_ENDINGS):
-                    sentence = buffer.strip()
-                    if sentence:
+                    sentence = clean_for_speech(buffer.strip())
+                    # Skip trivial content: empty, numbers only, single characters
+                    if sentence and not re.match(r'^[\d\.\,\s]+$', sentence) and len(sentence) > 2:
                         speak(sentence)
                     buffer = ""
 
                 if chunk.get("done", False):
                     break
 
-        # Speak any remaining buffer (response didn't end with punctuation)
+        # Speak any remaining buffer
         if buffer.strip():
-            speak(buffer.strip())
+            sentence = clean_for_speech(buffer.strip())
+            if sentence and not re.match(r'^[\d\.\,\s]+$', sentence) and len(sentence) > 2:
+                speak(sentence)
 
     except Exception as e:
         print(f"   Ollama error: {e}")
@@ -493,11 +501,9 @@ def main():
             print(f"{current_user or 'Visitor'}: {user_text}")
             messages.append({"role": "user", "content": user_text})
 
-            print("Nova: ", end="", flush=True)
             reply = ask_ollama_streaming(messages)
-            print()  # newline after streamed output
-            messages.append({"role": "assistant", "content": reply})
             print()
+            messages.append({"role": "assistant", "content": reply})
 
             if len(messages) > 22:
                 messages = [messages[0]] + messages[-20:]
